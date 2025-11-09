@@ -6,6 +6,12 @@ pom.xml.versionsBackup
 release.properties
 .flattened-pom.xml
 
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+.gradletasknamecache
+
 # Eclipse
 .project
 .classpath
@@ -13,24 +19,42 @@ release.properties
 bin/
 
 # IntelliJ
-.idea
+.idea/
 *.ipr
 *.iml
 *.iws
+out/
 
 # NetBeans
 nb-configuration.xml
+nbactions.xml
 
 # Visual Studio Code
-.vscode
+.vscode/
 .factorypath
 
 # OSX
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
 
 # Vim
 *.swp
 *.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
 
 # patch
 *.orig
@@ -38,8 +62,114 @@ nb-configuration.xml
 
 # Local environment
 .env
+.env.local
+.env.*.local
 
-# Plugin directory
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Build output
+target/
+dist/
+*.class
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+
+# .NET
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+*.suo
+*.cache
+
+# Quarkus
+.quarkus/
 /.quarkus/cli/plugins/
+
+# GitHub Copilot
+.github/java-upgrade/
+
 # TLS Certificates
 .certs/
+*.pem
+*.key
+*.crt
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+.tmp/
+
+# Generated files
+*.generated.*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE-specific files
+.vscode/settings.json
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/dictionaries
+.idea/vcs.xml
+.idea/jsLibraryMappings.xml
+.idea/dataSources.ids
+.idea/dataSources.xml
+.idea/dataSources.local.xml
+.idea/sqlDataSources.xml
+.idea/dynamic.xml
+.idea/uiDesigner.xml
+
+# Test coverage
+coverage/
+.nyc_output/
+*.lcov
+htmlcov/
+.coverage
+.coverage.*
+
+# Package files
+*.dmg
+*.pkg
+*.deb
+*.rpm
+
+# Backup files
+*-backup
+*.backup

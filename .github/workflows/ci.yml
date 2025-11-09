@@ -21,5 +21,38 @@ jobs:
           distribution: temurin
           cache: maven
 
-      - name: Build
+      - name: Build with Maven
         run: ./mvnw verify -B
+
+      - name: Build Quarkus JVM
+        run: ./mvnw package -B -Dquarkus.package.type=uber-jar
+
+      - name: Upload JVM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarkus-app-jvm
+          path: target/*-runner.jar
+          retention-days: 7
+
+  build-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '21'
+          distribution: 'graalvm-community'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache: maven
+
+      - name: Build Quarkus Native
+        run: ./mvnw package -B -Pnative -Dquarkus.native.container-build=true
+
+      - name: Upload Native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarkus-app-native
+          path: target/*-runner
+          retention-days: 7

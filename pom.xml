@@ -5,6 +5,17 @@
     <artifactId>build.env.intel</artifactId>
     <version>1.0.0-SNAPSHOT</version>
 
+    <name>Build Environment Intelligence</name>
+    <description>A Quarkus-based CLI tool for build environment analysis and SBOM generation</description>
+
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/licenses/MIT</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
     <properties>
         <compiler-plugin.version>3.14.1</compiler-plugin.version>
         <maven.compiler.release>21</maven.compiler.release>

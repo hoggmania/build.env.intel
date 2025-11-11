@@ -15,8 +15,19 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get_version.outputs.version }}
+      os_info: ${{ steps.os_info.outputs.os_info }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: Get OS information
+        id: os_info
+        run: |
+          OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
+          OS_VERSION=$(lsb_release -sr)
+          ARCH=$(uname -m)
+          OS_INFO="${OS_TYPE}-${OS_VERSION}-${ARCH}"
+          echo "os_info=$OS_INFO" >> $GITHUB_OUTPUT
+          echo "OS Info: $OS_INFO"
 
       - name: Set up JDK 25
         uses: actions/setup-java@v4
@@ -41,7 +52,7 @@ jobs:
       - name: Upload JVM artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bei-jvm-${{ steps.get_version.outputs.version }}
+          name: bei-jvm-${{ steps.os_info.outputs.os_info }}-${{ steps.get_version.outputs.version }}
           path: target/*-runner.jar
           retention-days: 7
 
@@ -65,7 +76,7 @@ jobs:
       - name: Upload Native artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bei-native-${{ needs.build.outputs.version }}
+          name: bei-native-${{ needs.build.outputs.os_info }}-${{ needs.build.outputs.version }}
           path: target/*-runner
           retention-days: 7
 
@@ -78,28 +89,47 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Get version from tag
+        id: tag_version
+        run: |
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          echo "tag_version=$TAG_VERSION" >> $GITHUB_OUTPUT
+          echo "Tag version: $TAG_VERSION"
+
       - name: Download JVM artifact
         uses: actions/download-artifact@v4
         with:
-          name: bei-jvm-${{ needs.build.outputs.version }}
+          name: bei-jvm-${{ needs.build.outputs.os_info }}-${{ steps.tag_version.outputs.tag_version }}
           path: artifacts/jvm
 
       - name: Download Native artifact
         uses: actions/download-artifact@v4
         with:
-          name: bei-native-${{ needs.build.outputs.version }}
+          name: bei-native-${{ needs.build.outputs.os_info }}-${{ steps.tag_version.outputs.tag_version }}
           path: artifacts/native
 
+      - name: Rename artifacts
+        run: |
+          cd artifacts/jvm
+          for file in *-runner.jar; do
+            mv "$file" "bei-${{ steps.tag_version.outputs.tag_version }}-${{ needs.build.outputs.os_info }}.jar"
+          done
+          cd ../native
+          for file in *-runner; do
+            mv "$file" "bei-${{ steps.tag_version.outputs.tag_version }}-${{ needs.build.outputs.os_info }}"
+          done
+
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/jvm/*-runner.jar
-            artifacts/native/*-runner
+            artifacts/jvm/bei-*.jar
+            artifacts/native/bei-*-runner
           body_path: RELEASE_NOTES.md
           draft: false
-          prerelease: ${{ contains(needs.build.outputs.version, 'SNAPSHOT') }}
+          prerelease: ${{ contains(steps.tag_version.outputs.tag_version, 'SNAPSHOT') || contains(steps.tag_version.outputs.tag_version, 'alpha') || contains(steps.tag_version.outputs.tag_version, 'beta') }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

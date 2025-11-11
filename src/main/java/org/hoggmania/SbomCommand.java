@@ -29,6 +29,8 @@ import picocli.CommandLine.Parameters;
 import picocli.CommandLine.Option;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 
 import java.io.*;
 import java.nio.file.*;
@@ -36,7 +38,19 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Command to inspect the environment and generate SBOM using appropriate CycloneDX plugin.
+ * Command to generate SBOM (Software Bill of Materials) using appropriate CycloneDX plugin.
+ * 
+ * <p>This command leverages {@link EnvScannerCommand} for environment detection and build system
+ * discovery, eliminating code duplication and ensuring consistent detection logic across both
+ * scan and sbom commands.</p>
+ * 
+ * <p>Architecture:
+ * <ul>
+ *   <li>Uses {@link EnvScannerCommand#scanFiles(Path)} to detect build systems</li>
+ *   <li>Uses {@link EnvScannerCommand#detectMultiModuleBuilds(Map)} to determine multi-module status</li>
+ *   <li>Delegates SBOM generation to build-system-specific generators in org.hoggmania.generators</li>
+ * </ul>
+ * </p>
  */
 @Command(name = "sbom", mixinStandardHelpOptions = true, description = "Generate SBOM using appropriate CycloneDX plugin for detected build system")
 public class SbomCommand implements Runnable {
@@ -71,6 +85,27 @@ public class SbomCommand implements Runnable {
         }
     }
 
+    @RegisterForReflection
+    static class SbomGenerationResult {
+        BuildSystemInfo buildInfo;
+        boolean success;
+        String output;
+        String errorOutput;
+        String expectedSbomPath;
+        boolean sbomFileExists;
+        long sbomFileSize;
+        String timestamp;
+        int exitCode;
+        String errorMessage;
+
+        public SbomGenerationResult(BuildSystemInfo buildInfo) {
+            this.buildInfo = buildInfo;
+            this.timestamp = java.time.Instant.now().toString();
+        }
+    }
+
+
+
     public static void main(String[] args) {
         if (args.length == 0) {
             args = new String[] {".", "--dry-run"};
@@ -92,10 +127,18 @@ public class SbomCommand implements Runnable {
             System.out.println("Inspecting environment at: " + rootDir.getAbsolutePath());
             System.out.println("Output directory: " + outputDir.getAbsolutePath());
             
-            BuildSystemInfo buildInfo = detectBuildSystem();
+            // Use EnvScannerCommand to scan for build systems
+            EnvScannerCommand scanner = new EnvScannerCommand();
+            Map<String, List<Path>> foundFiles = scanner.scanFiles(rootDir.toPath());
             
-            if (buildInfo == null) {
-                System.err.println("[ERROR] No supported build system detected");
+            // Use detailed build system detection to get filtered instances (excludes child modules)
+            Map<String, List<EnvScannerCommand.BuildSystemInstance>> detailedBuildSystems = 
+                scanner.detectDetailedBuildSystems(foundFiles);
+            
+            List<BuildSystemInfo> buildSystems = convertToBuildSystemInfo(detailedBuildSystems);
+            
+            if (buildSystems.isEmpty()) {
+                System.err.println(ConsoleColors.error("[ERROR]") + " No supported build system detected");
                 System.err.println("Supported build systems:");
                 System.err.println("  - Maven (pom.xml)");
                 System.err.println("  - Gradle (build.gradle, build.gradle.kts)");
@@ -109,517 +152,133 @@ public class SbomCommand implements Runnable {
                 return;
             }
 
-            System.out.println("\n=== Build System Detection ===");
-            System.out.println("Build System: " + buildInfo.buildSystem);
-            System.out.println("Project Name: " + buildInfo.projectName);
-            System.out.println("Multi-Module: " + buildInfo.multiModule);
-            System.out.println("Build Files Found: " + buildInfo.buildFiles.size());
-            buildInfo.buildFiles.forEach(f -> System.out.println("  - " + f));
-
-            System.out.println("\n=== CycloneDX Plugin Recommendation ===");
-            System.out.println("Plugin Command: " + buildInfo.pluginCommand);
+            System.out.println(ConsoleColors.bold("\n=== Build Systems Detected: " + buildSystems.size() + " ==="));
+            for (BuildSystemInfo buildInfo : buildSystems) {
+                System.out.println("\n--- " + ConsoleColors.info(buildInfo.buildSystem) + " ---");
+                System.out.println("Project Name: " + ConsoleColors.highlight(buildInfo.projectName));
+                System.out.println("Multi-Module: " + buildInfo.multiModule);
+                System.out.println("Build Files Found: " + buildInfo.buildFiles.size());
+                buildInfo.buildFiles.forEach(f -> System.out.println("  - " + f));
+                System.out.println("Working Directory: " + (buildInfo.workingDirectory != null ? buildInfo.workingDirectory : rootDir.toPath()));
+                System.out.println("Command: " + buildInfo.pluginCommand);
+            }
             
             if (dryRun) {
-                System.out.println("\n[DRY-RUN] Would execute: " + buildInfo.pluginCommand);
-                writeSummaryJson(buildInfo, true, false);
+                System.out.println(ConsoleColors.bold("\n[DRY-RUN]") + " Would execute the following commands:");
+                boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
+                for (BuildSystemInfo buildInfo : buildSystems) {
+                    System.out.println("\n--- " + ConsoleColors.info(buildInfo.buildSystem) + " ---");
+                    System.out.println("Project Name: " + ConsoleColors.highlight(buildInfo.projectName));
+                    File workDir = buildInfo.workingDirectory != null ? buildInfo.workingDirectory.toFile() : rootDir;
+                    System.out.println("Working Directory: " + workDir.getAbsolutePath());
+                    System.out.println("\nBuild Files:");
+                    buildInfo.buildFiles.forEach(f -> System.out.println("  - " + f));
+                    System.out.println("\nCommand to execute:");
+                    if (isWindows) {
+                        System.out.println("  cmd.exe /c " + buildInfo.pluginCommand);
+                    } else {
+                        System.out.println("  sh -c " + buildInfo.pluginCommand);
+                    }
+                }
+                writeSummaryJson(buildSystems, true, new ArrayList<>());
                 return;
             }
 
-            System.out.println("\n=== Generating SBOM ===");
-            boolean sbomSuccess = generateSbom(buildInfo);
+            System.out.println(ConsoleColors.bold("\n=== Generating SBOMs ==="));
+            List<Boolean> results = new ArrayList<>();
+            List<SbomGenerationResult> generationResults = new ArrayList<>();
+            for (BuildSystemInfo buildInfo : buildSystems) {
+                System.out.println("\n--- Generating SBOM for " + ConsoleColors.info(buildInfo.buildSystem) + " ---");
+                SbomGenerationResult result = generateSbomWithDetails(buildInfo);
+                results.add(result.success);
+                generationResults.add(result);
+            }
 
-            if (merge) {
-                System.out.println("\n=== Merging SBOMs ===");
+            if (merge && buildSystems.size() > 1) {
+                System.out.println(ConsoleColors.bold("\n=== Merging SBOMs ==="));
                 mergeSboms();
             }
 
             // Always write summary JSON
-            writeSummaryJson(buildInfo, false, sbomSuccess);
+            writeSummaryJson(buildSystems, false, results);
+            
+            // Write aggregate log
+            writeAggregateLog(generationResults);
 
         } catch (IOException e) {
             throw new RuntimeException("Error inspecting environment", e);
         }
     }
 
-    private BuildSystemInfo detectBuildSystem() throws IOException {
-        Path root = rootDir.toPath();
+    /**
+     * Convert the detailed build system instances from EnvScannerCommand into BuildSystemInfo objects
+     * that contain the necessary information for SBOM generation.
+     * 
+     * Uses BuildSystemGeneratorRegistry to abstract build system-specific logic.
+     * Only processes build systems that are not filtered out (i.e., multi-module roots and standalone projects).
+     */
+    private List<BuildSystemInfo> convertToBuildSystemInfo(
+            Map<String, List<EnvScannerCommand.BuildSystemInstance>> detailedBuildSystems) throws IOException {
+        List<BuildSystemInfo> buildSystems = new ArrayList<>();
         
-        // Check for Maven
-        List<Path> pomFiles = findFiles(root, "pom.xml");
-        if (!pomFiles.isEmpty()) {
-            Path primaryPomFile = pomFiles.get(0);
-            String projectName = extractMavenProjectName(primaryPomFile);
-            BuildSystemInfo info = new BuildSystemInfo("Maven", getMavenSbomCommand(projectName));
-            info.buildFiles = pomFiles.stream().map(Path::toString).collect(Collectors.toList());
-            info.multiModule = checkMavenMultiModule(pomFiles);
-            info.projectName = projectName;
-            info.workingDirectory = primaryPomFile.getParent();
-            return info;
-        }
-
-        // Check for Gradle
-        List<Path> gradleFiles = new ArrayList<>();
-        gradleFiles.addAll(findFiles(root, "build.gradle"));
-        gradleFiles.addAll(findFiles(root, "build.gradle.kts"));
-        if (!gradleFiles.isEmpty()) {
-            String projectName = extractGradleProjectName(root);
-            BuildSystemInfo info = new BuildSystemInfo("Gradle", getGradleSbomCommand(projectName));
-            info.buildFiles = gradleFiles.stream().map(Path::toString).collect(Collectors.toList());
-            info.multiModule = checkGradleMultiModule(root, gradleFiles);
-            info.projectName = projectName;
-            // Use root directory for Gradle (settings.gradle location)
-            info.workingDirectory = root;
-            return info;
-        }
-
-        // Check for npm
-        List<Path> packageJsonFiles = findFiles(root, "package.json");
-        if (!packageJsonFiles.isEmpty()) {
-            Path primaryPackageJson = packageJsonFiles.get(0);
-            String projectName = extractNpmProjectName(primaryPackageJson);
-            BuildSystemInfo info = new BuildSystemInfo("npm", getNpmSbomCommand(projectName));
-            info.buildFiles = packageJsonFiles.stream().map(Path::toString).collect(Collectors.toList());
-            info.multiModule = packageJsonFiles.size() > 1;
-            info.projectName = projectName;
-            info.workingDirectory = primaryPackageJson.getParent();
-            return info;
-        }
-
-        // Check for Python
-        List<Path> pythonFiles = new ArrayList<>();
-        pythonFiles.addAll(findFiles(root, "setup.py"));
-        pythonFiles.addAll(findFiles(root, "pyproject.toml"));
-        pythonFiles.addAll(findFiles(root, "requirements.txt"));
-        if (!pythonFiles.isEmpty()) {
-            Path primaryPythonFile = pythonFiles.get(0);
-            String projectName = extractPythonProjectName(pythonFiles);
-            BuildSystemInfo info = new BuildSystemInfo("Python", getPythonSbomCommand(projectName));
-            info.buildFiles = pythonFiles.stream().map(Path::toString).collect(Collectors.toList());
-            info.projectName = projectName;
-            info.workingDirectory = primaryPythonFile.getParent();
-            return info;
-        }
-
-        // Check for Go
-        List<Path> goModFiles = findFiles(root, "go.mod");
-        if (!goModFiles.isEmpty()) {
-            Path primaryGoMod = goModFiles.get(0);
-            String projectName = extractGoProjectName(primaryGoMod);
-            BuildSystemInfo info = new BuildSystemInfo("Go", getGoSbomCommand(projectName));
-            info.buildFiles = goModFiles.stream().map(Path::toString).collect(Collectors.toList());
-            info.multiModule = goModFiles.size() > 1;
-            info.projectName = projectName;
-            info.workingDirectory = primaryGoMod.getParent();
-            return info;
-        }
-
-        // Check for .NET
-        List<Path> dotnetFiles = new ArrayList<>();
-        dotnetFiles.addAll(findFilesByPattern(root, "*.csproj"));
-        dotnetFiles.addAll(findFilesByPattern(root, "*.vbproj"));
-        dotnetFiles.addAll(findFilesByPattern(root, "*.fsproj"));
-        dotnetFiles.addAll(findFiles(root, "*.sln"));
-        if (!dotnetFiles.isEmpty()) {
-            Path primaryDotnetFile = dotnetFiles.get(0);
-            String projectName = extractDotnetProjectName(primaryDotnetFile);
-            BuildSystemInfo info = new BuildSystemInfo(".NET", getDotnetSbomCommand(projectName));
-            info.buildFiles = dotnetFiles.stream().map(Path::toString).collect(Collectors.toList());
-            info.multiModule = dotnetFiles.size() > 1;
-            info.projectName = projectName;
-            info.workingDirectory = primaryDotnetFile.getParent();
-            return info;
-        }
-
-        // Check for Rust
-        List<Path> cargoFiles = findFiles(root, "Cargo.toml");
-        if (!cargoFiles.isEmpty()) {
-            Path primaryCargoFile = cargoFiles.get(0);
-            String projectName = extractRustProjectName(primaryCargoFile);
-            BuildSystemInfo info = new BuildSystemInfo("Rust", getRustSbomCommand(projectName));
-            info.buildFiles = cargoFiles.stream().map(Path::toString).collect(Collectors.toList());
-            info.multiModule = cargoFiles.size() > 1;
-            info.projectName = projectName;
-            info.workingDirectory = primaryCargoFile.getParent();
-            return info;
-        }
-
-        // Check for PHP (Composer)
-        List<Path> composerFiles = findFiles(root, "composer.json");
-        if (!composerFiles.isEmpty()) {
-            Path primaryComposerFile = composerFiles.get(0);
-            String projectName = extractPhpProjectName(primaryComposerFile);
-            BuildSystemInfo info = new BuildSystemInfo("PHP", getPhpSbomCommand(projectName));
-            info.buildFiles = composerFiles.stream().map(Path::toString).collect(Collectors.toList());
-            info.multiModule = composerFiles.size() > 1;
-            info.projectName = projectName;
-            info.workingDirectory = primaryComposerFile.getParent();
-            return info;
-        }
-
-        // Check for Ruby
-        List<Path> gemFiles = findFiles(root, "Gemfile");
-        if (!gemFiles.isEmpty()) {
-            Path primaryGemFile = gemFiles.get(0);
-            String projectName = extractRubyProjectName(root);
-            BuildSystemInfo info = new BuildSystemInfo("Ruby", getRubySbomCommand(projectName));
-            info.buildFiles = gemFiles.stream().map(Path::toString).collect(Collectors.toList());
-            info.multiModule = gemFiles.size() > 1;
-            info.projectName = projectName;
-            info.workingDirectory = primaryGemFile.getParent();
-            return info;
-        }
-
-        return null;
-    }
-
-    private List<Path> findFiles(Path root, String filename) throws IOException {
-        try (var stream = Files.find(root, Integer.MAX_VALUE,
-                (p, attr) -> p.getFileName().toString().equals(filename))) {
-            return stream.collect(Collectors.toList());
-        }
-    }
-
-    private List<Path> findFilesByPattern(Path root, String pattern) throws IOException {
-        String regex = pattern.replace("*", ".*").replace("?", ".");
-        try (var stream = Files.find(root, Integer.MAX_VALUE,
-                (p, attr) -> p.getFileName().toString().matches(regex))) {
-            return stream.collect(Collectors.toList());
-        }
-    }
-
-    private boolean checkMavenMultiModule(List<Path> pomFiles) {
-        if (pomFiles.size() <= 1) return false;
-        
-        for (Path pomFile : pomFiles) {
-            try {
-                String content = Files.readString(pomFile);
-                if (content.contains("<modules>") || content.contains("<module>")) {
-                    return true;
-                }
-            } catch (IOException e) {
-                // Continue checking
-            }
-        }
-        return false;
-    }
-
-    private boolean checkGradleMultiModule(Path root, List<Path> gradleFiles) {
-        if (gradleFiles.size() <= 1) return false;
-        
-        try {
-            Path settingsGradle = root.resolve("settings.gradle");
-            Path settingsGradleKts = root.resolve("settings.gradle.kts");
+        for (Map.Entry<String, List<EnvScannerCommand.BuildSystemInstance>> entry : detailedBuildSystems.entrySet()) {
+            String buildSystemName = entry.getKey();
+            List<EnvScannerCommand.BuildSystemInstance> instances = entry.getValue();
             
-            if (Files.exists(settingsGradle)) {
-                String content = Files.readString(settingsGradle);
-                if (content.contains("include(") || content.contains("include ")) {
-                    return true;
-                }
+            // Process each instance (these are already filtered - child modules excluded)
+            for (EnvScannerCommand.BuildSystemInstance instance : instances) {
+                // Get the generator for this build system
+                BuildSystemGeneratorRegistry.getGenerator(buildSystemName).ifPresent(generator -> {
+                    Path buildFilePath = Paths.get(instance.getPath());
+                    
+                    // Extract project name using generator
+                    String projectName = generator.extractProjectName(buildFilePath);
+                    
+                    // Generate SBOM command using generator with absolute build file path
+                    String sbomCommand = generator.generateSbomCommand(projectName, outputDir, buildFilePath);
+                    
+                    // Create BuildSystemInfo
+                    BuildSystemInfo info = new BuildSystemInfo(buildSystemName, sbomCommand);
+                    info.buildFiles = Collections.singletonList(instance.getPath());
+                    info.multiModule = instance.isMultiModule();
+                    info.projectName = projectName;
+                    
+                    // Set working directory to build file's parent directory
+                    // (where settings.gradle/pom.xml/package.json etc. are located)
+                    info.workingDirectory = buildFilePath.getParent();
+                    
+                    buildSystems.add(info);
+                });
             }
-            if (Files.exists(settingsGradleKts)) {
-                String content = Files.readString(settingsGradleKts);
-                if (content.contains("include(") || content.contains("include ")) {
-                    return true;
-                }
-            }
-        } catch (IOException e) {
-            // Ignore
+        }
+
+        return buildSystems;
+    }
+
+    private SbomGenerationResult generateSbomWithDetails(BuildSystemInfo buildInfo) {
+        SbomGenerationResult result = new SbomGenerationResult(buildInfo);
+        
+        // First check if the required build tool is available
+        if (!checkBuildToolAvailable(buildInfo.buildSystem)) {
+            result.success = false;
+            result.errorMessage = "Build tool not available for " + buildInfo.buildSystem + 
+                            "\nPlease ensure the required tool is installed and in your PATH";
+            System.err.println(ConsoleColors.error("[ERROR]") + " " + result.errorMessage);
+            writeSbomLogFile(result);
+            return result;
         }
         
-        return gradleFiles.size() > 1;
-    }
-
-    private String extractMavenProjectName(Path pomFile) {
-        try {
-            String content = Files.readString(pomFile);
-            // Extract artifactId from pom.xml
-            int artifactIdStart = content.indexOf("<artifactId>");
-            int artifactIdEnd = content.indexOf("</artifactId>");
-            if (artifactIdStart > 0 && artifactIdEnd > artifactIdStart) {
-                return content.substring(artifactIdStart + 12, artifactIdEnd).trim();
-            }
-        } catch (IOException e) {
-            // Ignore
-        }
-        return "maven-project";
-    }
-
-    private String extractGradleProjectName(Path root) {
-        try {
-            Path settingsGradle = root.resolve("settings.gradle");
-            Path settingsGradleKts = root.resolve("settings.gradle.kts");
-            
-            Path settingsFile = Files.exists(settingsGradle) ? settingsGradle : 
-                               Files.exists(settingsGradleKts) ? settingsGradleKts : null;
-            
-            if (settingsFile != null) {
-                String content = Files.readString(settingsFile);
-                // Extract rootProject.name
-                int nameStart = content.indexOf("rootProject.name");
-                if (nameStart > 0) {
-                    int equalsPos = content.indexOf("=", nameStart);
-                    if (equalsPos > 0) {
-                        int lineEnd = content.indexOf("\n", equalsPos);
-                        if (lineEnd < 0) lineEnd = content.length();
-                        String nameLine = content.substring(equalsPos + 1, lineEnd).trim();
-                        return nameLine.replaceAll("['\"]", "").trim();
-                    }
-                }
-            }
-        } catch (IOException e) {
-            // Ignore
-        }
-        // Fallback to directory name
-        return root.getFileName().toString();
-    }
-
-    private String extractNpmProjectName(Path packageJson) {
-        try {
-            String content = Files.readString(packageJson);
-            // Extract "name" field from package.json
-            int nameStart = content.indexOf("\"name\"");
-            if (nameStart > 0) {
-                int colonPos = content.indexOf(":", nameStart);
-                int commaPos = content.indexOf(",", colonPos);
-                int bracePos = content.indexOf("}", colonPos);
-                int endPos = commaPos > 0 ? Math.min(commaPos, bracePos > 0 ? bracePos : Integer.MAX_VALUE) : bracePos;
-                if (colonPos > 0 && endPos > colonPos) {
-                    String name = content.substring(colonPos + 1, endPos).trim();
-                    return name.replaceAll("['\",]", "").trim();
-                }
-            }
-        } catch (IOException e) {
-            // Ignore
-        }
-        return "npm-project";
-    }
-
-    private String extractPythonProjectName(List<Path> pythonFiles) {
-        // Check setup.py for name
-        for (Path file : pythonFiles) {
-            if (file.getFileName().toString().equals("setup.py")) {
-                try {
-                    String content = Files.readString(file);
-                    int nameStart = content.indexOf("name=");
-                    if (nameStart > 0) {
-                        int quoteStart = content.indexOf("\"", nameStart);
-                        if (quoteStart < 0) quoteStart = content.indexOf("'", nameStart);
-                        if (quoteStart > 0) {
-                            int quoteEnd = content.indexOf(content.charAt(quoteStart), quoteStart + 1);
-                            if (quoteEnd > 0) {
-                                return content.substring(quoteStart + 1, quoteEnd).trim();
-                            }
-                        }
-                    }
-                } catch (IOException e) {
-                    // Continue
-                }
+        // For Go projects, ensure dependencies are downloaded first
+        if ("Go".equals(buildInfo.buildSystem)) {
+            if (!prepareGoModule(buildInfo)) {
+                System.err.println(ConsoleColors.warning("[WARNING]") + " Failed to prepare Go module, continuing anyway...");
             }
         }
         
-        // Check pyproject.toml for name
-        for (Path file : pythonFiles) {
-            if (file.getFileName().toString().equals("pyproject.toml")) {
-                try {
-                    String content = Files.readString(file);
-                    int nameStart = content.indexOf("name =");
-                    if (nameStart > 0) {
-                        int quoteStart = content.indexOf("\"", nameStart);
-                        if (quoteStart < 0) quoteStart = content.indexOf("'", nameStart);
-                        if (quoteStart > 0) {
-                            int quoteEnd = content.indexOf(content.charAt(quoteStart), quoteStart + 1);
-                            if (quoteEnd > 0) {
-                                return content.substring(quoteStart + 1, quoteEnd).trim();
-                            }
-                        }
-                    }
-                } catch (IOException e) {
-                    // Continue
-                }
-            }
-        }
-        
-        return "python-project";
-    }
-
-    private String extractGoProjectName(Path goMod) {
-        try {
-            String content = Files.readString(goMod);
-            // Extract module name from go.mod
-            int moduleStart = content.indexOf("module ");
-            if (moduleStart >= 0) {
-                int lineEnd = content.indexOf("\n", moduleStart);
-                if (lineEnd < 0) lineEnd = content.length();
-                String moduleLine = content.substring(moduleStart + 7, lineEnd).trim();
-                // Get the last part of the module path
-                String[] parts = moduleLine.split("/");
-                return parts[parts.length - 1];
-            }
-        } catch (IOException e) {
-            // Ignore
-        }
-        return "go-project";
-    }
-
-    private String extractDotnetProjectName(Path projectFile) {
-        try {
-            String fileName = projectFile.getFileName().toString();
-            // Extract from .csproj, .vbproj, .fsproj, or .sln filename
-            if (fileName.endsWith(".sln")) {
-                return fileName.substring(0, fileName.length() - 4);
-            } else if (fileName.endsWith(".csproj") || fileName.endsWith(".vbproj") || fileName.endsWith(".fsproj")) {
-                return fileName.substring(0, fileName.lastIndexOf('.'));
-            }
-            
-            // Try to extract from project file content
-            String content = Files.readString(projectFile);
-            int nameStart = content.indexOf("<AssemblyName>");
-            if (nameStart > 0) {
-                int nameEnd = content.indexOf("</AssemblyName>", nameStart);
-                if (nameEnd > nameStart) {
-                    return content.substring(nameStart + 14, nameEnd).trim();
-                }
-            }
-        } catch (IOException e) {
-            // Ignore
-        }
-        return "dotnet-project";
-    }
-
-    private String extractRustProjectName(Path cargoToml) {
-        try {
-            String content = Files.readString(cargoToml);
-            // Extract name from [package] section
-            int packageStart = content.indexOf("[package]");
-            if (packageStart >= 0) {
-                int nameStart = content.indexOf("name =", packageStart);
-                if (nameStart > 0) {
-                    int quoteStart = content.indexOf("\"", nameStart);
-                    if (quoteStart > 0) {
-                        int quoteEnd = content.indexOf("\"", quoteStart + 1);
-                        if (quoteEnd > 0) {
-                            return content.substring(quoteStart + 1, quoteEnd).trim();
-                        }
-                    }
-                }
-            }
-        } catch (IOException e) {
-            // Ignore
-        }
-        return "rust-project";
-    }
-
-    private String extractPhpProjectName(Path composerJson) {
-        try {
-            String content = Files.readString(composerJson);
-            // Extract "name" field from composer.json
-            int nameStart = content.indexOf("\"name\"");
-            if (nameStart > 0) {
-                int colonPos = content.indexOf(":", nameStart);
-                int quoteStart = content.indexOf("\"", colonPos);
-                if (quoteStart > 0) {
-                    int quoteEnd = content.indexOf("\"", quoteStart + 1);
-                    if (quoteEnd > 0) {
-                        String fullName = content.substring(quoteStart + 1, quoteEnd).trim();
-                        // composer.json names are typically "vendor/package"
-                        String[] parts = fullName.split("/");
-                        return parts.length > 1 ? parts[1] : fullName;
-                    }
-                }
-            }
-        } catch (IOException e) {
-            // Ignore
-        }
-        return "php-project";
-    }
-
-    private String extractRubyProjectName(Path root) {
-        // Try to extract from .gemspec file
-        try {
-            List<Path> gemspecFiles = findFilesByPattern(root, "*.gemspec");
-            if (!gemspecFiles.isEmpty()) {
-                String fileName = gemspecFiles.get(0).getFileName().toString();
-                return fileName.substring(0, fileName.lastIndexOf('.'));
-            }
-        } catch (IOException e) {
-            // Continue
-        }
-        
-        // Fallback to directory name
-        return root.getFileName().toString();
-    }
-
-    private String getMavenSbomCommand(String projectName) {
-        String outputPath = outputDir.getAbsolutePath();
-        
-        return String.format("mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom -DoutputFormat=json -DoutputDirectory=%s -DoutputName=%s-bom",
-                outputPath, projectName);
-    }
-
-    private String getGradleSbomCommand(String projectName) {
-        String outputPath = outputDir.getAbsolutePath();
-        
-        return String.format("gradle cyclonedxBom -PcyclonedxOutputFormat=json -PcyclonedxOutputDirectory=%s -PcyclonedxOutputName=%s-bom",
-                outputPath, projectName);
-    }
-
-    private String getNpmSbomCommand(String projectName) {
-        String outputPath = outputDir.getAbsolutePath();
-        String outputFile = projectName + "-bom.json";
-        
-        return String.format("npx @cyclonedx/cyclonedx-npm --output-file %s/%s",
-                outputPath, outputFile);
-    }
-
-    private String getPythonSbomCommand(String projectName) {
-        String outputPath = outputDir.getAbsolutePath();
-        String outputFile = projectName + "-bom.json";
-        
-        return String.format("cyclonedx-py --format json --output %s/%s",
-                outputPath, outputFile);
-    }
-
-    private String getGoSbomCommand(String projectName) {
-        String outputPath = outputDir.getAbsolutePath();
-        String outputFile = projectName + "-bom.json";
-        
-        return String.format("cyclonedx-gomod app -json=true -output %s/%s",
-                outputPath, outputFile);
-    }
-
-    private String getDotnetSbomCommand(String projectName) {
-        String outputPath = outputDir.getAbsolutePath();
-        
-        return String.format("dotnet CycloneDX . -o %s -f json -n %s-bom",
-                outputPath, projectName);
-    }
-
-    private String getRustSbomCommand(String projectName) {
-        String outputPath = outputDir.getAbsolutePath();
-        String outputFile = projectName + "-bom.json";
-        
-        return String.format("cargo cyclonedx -f json --output-file %s/%s",
-                outputPath, outputFile);
-    }
-
-    private String getPhpSbomCommand(String projectName) {
-        String outputPath = outputDir.getAbsolutePath();
-        String outputFile = projectName + "-bom.json";
-        
-        return String.format("composer make-bom --output-format=json --output-file=%s/%s",
-                outputPath, outputFile);
-    }
-
-    private String getRubySbomCommand(String projectName) {
-        String outputPath = outputDir.getAbsolutePath();
-        String outputFile = projectName + "-bom.json";
-        
-        return String.format("cyclonedx-ruby -o %s/%s -t json",
-                outputPath, outputFile);
-    }
-
-    private boolean generateSbom(BuildSystemInfo buildInfo) {
         boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
+        File workDir = buildInfo.workingDirectory != null ? buildInfo.workingDirectory.toFile() : rootDir;
+        StringBuilder outputCapture = new StringBuilder();
+        StringBuilder errorCapture = new StringBuilder();
         
         try {
             List<String> command = new ArrayList<>();
@@ -635,50 +294,331 @@ public class SbomCommand implements Runnable {
             command.add(buildInfo.pluginCommand);
             
             ProcessBuilder pb = new ProcessBuilder(command);
-            // Use the working directory where the build file is located
-            File workDir = buildInfo.workingDirectory != null ? buildInfo.workingDirectory.toFile() : rootDir;
             pb.directory(workDir);
-            pb.inheritIO(); // Show output in real-time
+            pb.redirectErrorStream(false);
             
             System.out.println("Executing: " + buildInfo.pluginCommand);
             System.out.println("Working directory: " + workDir.getAbsolutePath());
             System.out.println();
             
             Process process = pb.start();
-            int exitCode = process.waitFor();
             
-            if (exitCode == 0) {
-                System.out.println("\n[SUCCESS] SBOM generated successfully");
-                System.out.println("Output location: " + outputDir.getAbsolutePath());
-                return true;
-            } else {
-                System.err.println("\n[ERROR] SBOM generation failed with exit code: " + exitCode);
-                return false;
+            // Capture stdout and stderr
+            Thread outputThread = new Thread(() -> {
+                try (var reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        System.out.println(line);
+                        outputCapture.append(line).append("\n");
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            });
+            
+            Thread errorThread = new Thread(() -> {
+                try (var reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getErrorStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        System.err.println(line);
+                        errorCapture.append(line).append("\n");
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            });
+            
+            outputThread.start();
+            errorThread.start();
+            
+            int exitCode = process.waitFor();
+            outputThread.join();
+            errorThread.join();
+            
+            result.exitCode = exitCode;
+            result.output = outputCapture.toString();
+            result.errorOutput = errorCapture.toString();
+            result.expectedSbomPath = getExpectedSbomPath(buildInfo);
+            
+            File sbomFile = new File(result.expectedSbomPath);
+            result.sbomFileExists = sbomFile.exists();
+            if (sbomFile.exists()) {
+                result.sbomFileSize = sbomFile.length();
             }
             
+            if (exitCode == 0) {
+                result.success = true;
+                System.out.println("\n" + ConsoleColors.success("[SUCCESS]") + " SBOM generated successfully");
+                System.out.println("Output location: " + ConsoleColors.highlight(outputDir.getAbsolutePath()));
+            } else {
+                result.success = false;
+                result.errorMessage = "SBOM generation failed with exit code: " + exitCode;
+                System.err.println("\n" + ConsoleColors.error("[ERROR]") + " " + result.errorMessage);
+            }
+            
+            writeSbomLogFile(result);
+            return result;
+            
         } catch (IOException | InterruptedException e) {
-            System.err.println("[ERROR] Failed to execute SBOM generation: " + e.getMessage());
+            result.success = false;
+            result.errorMessage = "Failed to execute SBOM generation: " + e.getMessage();
+            result.output = outputCapture.toString();
+            result.errorOutput = errorCapture.toString();
+            System.err.println(ConsoleColors.error("[ERROR]") + " " + result.errorMessage);
             e.printStackTrace();
+            writeSbomLogFile(result);
+            return result;
+        }
+    }
+
+    private String getExpectedSbomPath(BuildSystemInfo buildInfo) {
+        String sbomFileName = buildInfo.projectName + "-bom.json";
+        return new File(outputDir, sbomFileName).getAbsolutePath();
+    }
+
+    private void writeSbomLogFile(SbomGenerationResult result) {
+        try {
+            BuildSystemInfo buildInfo = result.buildInfo;
+            String logFileName = buildInfo.projectName + "-" + buildInfo.buildSystem.toLowerCase().replace(" ", "-") + "-sbom-log.json";
+            File logFile = new File(outputDir, logFileName);
+            
+            File workDir = buildInfo.workingDirectory != null ? buildInfo.workingDirectory.toFile() : rootDir;
+            
+            ObjectMapper mapper = new ObjectMapper();
+            ObjectNode logData = mapper.createObjectNode();
+            logData.put("buildSystem", buildInfo.buildSystem);
+            logData.put("projectName", buildInfo.projectName);
+            logData.put("success", result.success);
+            logData.put("timestamp", result.timestamp);
+            logData.put("workingDirectory", workDir.getAbsolutePath());
+            logData.put("command", buildInfo.pluginCommand);
+            logData.put("outputDirectory", outputDir.getAbsolutePath());
+            
+            if (result.exitCode != 0 || !result.success) {
+                logData.put("exitCode", result.exitCode);
+            }
+            
+            if (result.expectedSbomPath != null) {
+                logData.put("expectedSbomPath", result.expectedSbomPath);
+                logData.put("sbomFileExists", result.sbomFileExists);
+                if (result.sbomFileExists) {
+                    logData.put("sbomFileSize", result.sbomFileSize);
+                }
+            }
+            
+            ArrayNode buildFilesArray = mapper.createArrayNode();
+            buildInfo.buildFiles.forEach(buildFilesArray::add);
+            logData.set("buildFiles", buildFilesArray);
+            
+            logData.put("multiModule", buildInfo.multiModule);
+            
+            if (result.output != null && !result.output.trim().isEmpty()) {
+                logData.put("stdout", result.output);
+            }
+            
+            if (result.errorOutput != null && !result.errorOutput.trim().isEmpty()) {
+                logData.put("stderr", result.errorOutput);
+            }
+            
+            if (result.errorMessage != null && !result.errorMessage.trim().isEmpty()) {
+                logData.put("errorMessage", result.errorMessage);
+            }
+            
+            mapper.writerWithDefaultPrettyPrinter().writeValue(logFile, logData);
+            System.out.println("Log file created: " + ConsoleColors.highlight(logFile.getAbsolutePath()));
+            
+        } catch (IOException e) {
+            System.err.println(ConsoleColors.warning("[WARNING]") + " Failed to write SBOM log file: " + e.getMessage());
+        }
+    }
+
+    private void writeAggregateLog(List<SbomGenerationResult> results) {
+        try {
+            File aggregateLogFile = new File(outputDir, "sbom-generation-aggregate.json");
+            
+            ObjectMapper mapper = new ObjectMapper();
+            ObjectNode aggregateData = mapper.createObjectNode();
+            
+            aggregateData.put("timestamp", java.time.Instant.now().toString());
+            aggregateData.put("rootDirectory", rootDir.getAbsolutePath());
+            aggregateData.put("outputDirectory", outputDir.getAbsolutePath());
+            aggregateData.put("totalBuildSystems", results.size());
+            
+            int successCount = 0;
+            int failureCount = 0;
+            long totalSbomSize = 0;
+            
+            for (SbomGenerationResult result : results) {
+                if (result.success) {
+                    successCount++;
+                    if (result.sbomFileExists) {
+                        totalSbomSize += result.sbomFileSize;
+                    }
+                } else {
+                    failureCount++;
+                }
+            }
+            
+            aggregateData.put("successfulGenerations", successCount);
+            aggregateData.put("failedGenerations", failureCount);
+            aggregateData.put("totalSbomSize", totalSbomSize);
+            
+            // Add summary array
+            ArrayNode summaryArray = mapper.createArrayNode();
+            for (SbomGenerationResult result : results) {
+                ObjectNode summaryItem = mapper.createObjectNode();
+                summaryItem.put("buildSystem", result.buildInfo.buildSystem);
+                summaryItem.put("projectName", result.buildInfo.projectName);
+                summaryItem.put("success", result.success);
+                summaryItem.put("multiModule", result.buildInfo.multiModule);
+                
+                if (result.expectedSbomPath != null) {
+                    summaryItem.put("sbomPath", result.expectedSbomPath);
+                    summaryItem.put("sbomExists", result.sbomFileExists);
+                    if (result.sbomFileExists) {
+                        summaryItem.put("sbomSize", result.sbomFileSize);
+                    }
+                }
+                
+                if (!result.success && result.errorMessage != null) {
+                    summaryItem.put("error", result.errorMessage);
+                }
+                
+                if (result.exitCode != 0) {
+                    summaryItem.put("exitCode", result.exitCode);
+                }
+                
+                File workDir = result.buildInfo.workingDirectory != null ? result.buildInfo.workingDirectory.toFile() : rootDir;
+                summaryItem.put("workingDirectory", workDir.getAbsolutePath());
+                
+                String logFileName = result.buildInfo.projectName + "-" + result.buildInfo.buildSystem.toLowerCase().replace(" ", "-") + "-sbom-log.json";
+                summaryItem.put("detailedLogFile", logFileName);
+                
+                summaryArray.add(summaryItem);
+            }
+            
+            aggregateData.set("buildSystems", summaryArray);
+            
+            mapper.writerWithDefaultPrettyPrinter().writeValue(aggregateLogFile, aggregateData);
+            
+            System.out.println(ConsoleColors.bold("\n=== SBOM Generation Summary ==="));
+            System.out.println("Total build systems: " + results.size());
+            System.out.println(ConsoleColors.success("Successful: " + successCount));
+            if (failureCount > 0) {
+                System.out.println(ConsoleColors.error("Failed: " + failureCount));
+            } else {
+                System.out.println("Failed: " + failureCount);
+            }
+            System.out.println("Aggregate log: " + ConsoleColors.highlight(aggregateLogFile.getAbsolutePath()));
+            
+        } catch (IOException e) {
+            System.err.println(ConsoleColors.warning("[WARNING]") + " Failed to write aggregate log file: " + e.getMessage());
+        }
+    }
+
+    private boolean prepareGoModule(BuildSystemInfo buildInfo) {
+        boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
+        File workDir = buildInfo.workingDirectory != null ? buildInfo.workingDirectory.toFile() : rootDir;
+        
+        try {
+            List<String> command = new ArrayList<>();
+            
+            if (isWindows) {
+                command.add("cmd.exe");
+                command.add("/c");
+            } else {
+                command.add("sh");
+                command.add("-c");
+            }
+            
+            command.add("go mod download");
+            
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.directory(workDir);
+            pb.redirectErrorStream(true);
+            pb.redirectOutput(ProcessBuilder.Redirect.PIPE);
+            
+            System.out.println("[INFO] Downloading Go module dependencies...");
+            Process process = pb.start();
+            int exitCode = process.waitFor();
+            
+            return exitCode == 0;
+            
+        } catch (IOException | InterruptedException e) {
             return false;
         }
     }
 
-    private void writeSummaryJson(BuildSystemInfo buildInfo, boolean dryRun, boolean success) throws IOException {
+    private boolean checkBuildToolAvailable(String buildSystem) {
+        // Get the version check command from the registry
+        String command = BuildSystemGeneratorRegistry.getGenerator(buildSystem)
+                .map(BuildSystemSbomGenerator::getVersionCheckCommand)
+                .orElse(null);
+        
+        if (command == null) {
+            return true; // Skip check if no version command defined
+        }
+
+        boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
+        
+        try {
+            List<String> cmd = new ArrayList<>();
+            
+            if (isWindows) {
+                cmd.add("cmd.exe");
+                cmd.add("/c");
+            } else {
+                cmd.add("sh");
+                cmd.add("-c");
+            }
+            
+            cmd.add(command);
+            
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            pb.redirectOutput(ProcessBuilder.Redirect.PIPE);
+            
+            Process process = pb.start();
+            int exitCode = process.waitFor();
+            
+            return exitCode == 0;
+            
+        } catch (IOException | InterruptedException e) {
+            return false;
+        }
+    }
+
+    private void writeSummaryJson(List<BuildSystemInfo> buildSystems, boolean dryRun, List<Boolean> results) throws IOException {
         Map<String, Object> summary = new LinkedHashMap<>();
         summary.put("timestamp", new Date().toString());
         summary.put("rootDirectory", rootDir.getAbsolutePath());
         summary.put("outputDirectory", outputDir.getAbsolutePath());
-        summary.put("buildSystem", buildInfo.buildSystem);
-        summary.put("projectName", buildInfo.projectName);
-        summary.put("multiModule", buildInfo.multiModule);
-        summary.put("buildFiles", buildInfo.buildFiles);
-        summary.put("workingDirectory", buildInfo.workingDirectory != null ? buildInfo.workingDirectory.toString() : null);
-        summary.put("pluginCommand", buildInfo.pluginCommand);
+        summary.put("buildSystemsDetected", buildSystems.size());
         summary.put("format", "json");
         summary.put("dryRun", dryRun);
         
+        // Add details for each build system
+        List<Map<String, Object>> buildSystemDetails = new ArrayList<>();
+        for (int i = 0; i < buildSystems.size(); i++) {
+            BuildSystemInfo buildInfo = buildSystems.get(i);
+            Map<String, Object> details = new LinkedHashMap<>();
+            details.put("buildSystem", buildInfo.buildSystem);
+            details.put("projectName", buildInfo.projectName);
+            details.put("multiModule", buildInfo.multiModule);
+            details.put("buildFiles", buildInfo.buildFiles);
+            details.put("workingDirectory", buildInfo.workingDirectory != null ? buildInfo.workingDirectory.toString() : null);
+            details.put("pluginCommand", buildInfo.pluginCommand);
+            if (!dryRun && i < results.size()) {
+                details.put("generationSuccess", results.get(i));
+            }
+            buildSystemDetails.add(details);
+        }
+        summary.put("buildSystems", buildSystemDetails);
+        
         if (!dryRun) {
-            summary.put("generationSuccess", success);
+            // Calculate overall success
+            boolean allSuccess = results.stream().allMatch(Boolean::booleanValue);
+            summary.put("overallSuccess", allSuccess);
             
             // List generated SBOM files (JSON only)
             List<String> generatedFiles = new ArrayList<>();
@@ -698,7 +638,8 @@ public class SbomCommand implements Runnable {
         ObjectMapper mapper = new ObjectMapper();
         File summaryFile = new File(outputDir, "sbom-summary.json");
         mapper.writerWithDefaultPrettyPrinter().writeValue(summaryFile, summary);
-        System.out.println("\n[SUCCESS] Summary written to " + summaryFile.getAbsolutePath());
+        System.out.println("\n" + ConsoleColors.success("[SUCCESS]") + " Summary written to " + 
+            ConsoleColors.highlight(summaryFile.getAbsolutePath()));
     }
 
     private void mergeSboms() throws IOException {

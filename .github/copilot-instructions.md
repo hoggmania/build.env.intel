@@ -43,12 +43,15 @@ Affects: `BuildSystemInfo`, `ToolVersionInfo`, `FileTypeInfo`
 ### JSON Output Pattern
 Both commands ALWAYS generate JSON (no optional flags):
 - **scan**: Prints to console + writes `scan-results.json` (or `--output` file)
-- **sbom**: Prints to console + writes `sbom-summary.json` + actual SBOM files
+- **sbom**: Prints to console + writes `sbom-summary.json` + actual SBOM files for ALL detected build systems
 
 ## Build System Detection Flow
 
-### Detection Order (SbomCommand)
-Sequential checks in priority order: Maven → Gradle → npm → Python → Go → .NET → Rust → PHP → Ruby
+### Multi-System Detection (SbomCommand)
+**Critical**: `detectAllBuildSystems()` returns `List<BuildSystemInfo>` - detects ALL build systems, not just the first one
+- Checks for all 9 build systems: Maven → Gradle → npm → Python → Go → .NET → Rust → PHP → Ruby
+- Generates SBOMs for each detected system in a single run
+- Automatically merges if multiple systems found (polyglot projects)
 
 ### Project Name Extraction Pattern
 Each build system has dedicated extraction logic:
@@ -75,8 +78,8 @@ pb.directory(workingDirectory.toFile()); // Set ProcessBuilder directory
 # JVM uber-jar (standard)
 ./mvnw clean package -Dquarkus.package.type=uber-jar
 
-# Native (requires GraalVM 21+)
-./mvnw clean package -Dnative
+# Native build~
+cmd /c "call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" && mvn clean package -Pnative"
 
 # Native in Docker (no local GraalVM needed)
 ./mvnw clean package -Dnative -Dquarkus.native.container-build=true

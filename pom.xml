@@ -3,7 +3,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>org.hoggmania</groupId>
     <artifactId>build.env.intel</artifactId>
-    <version>1.0.1</version>
+    <version>1.0.2</version>
 
     <name>Build Environment Intelligence</name>
     <description>A Quarkus-based CLI tool for build environment analysis and SBOM generation</description>

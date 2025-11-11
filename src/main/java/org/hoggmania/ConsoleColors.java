@@ -42,8 +42,12 @@ public class ConsoleColors {
     
     private static boolean checkAnsiSupport() {
         // Check if running in a terminal that supports ANSI colors
-        String os = System.getProperty("os.name").toLowerCase();
-        if (os.contains("win")) {
+        String os = System.getProperty("os.name");
+        if (os == null) {
+            return false; // Can't determine OS
+        }
+        
+        if (os.toLowerCase().contains("win")) {
             // Only enable colors in Windows Terminal or VS Code integrated terminal
             String wtSession = System.getenv("WT_SESSION");
             String termProgram = System.getenv("TERM_PROGRAM");
@@ -55,8 +59,10 @@ public class ConsoleColors {
                    "vscode".equals(termProgram) || 
                    vscodeInjection != null;
         }
+        
         // Unix-like systems generally support ANSI
-        return !System.getenv("TERM").equals("dumb");
+        String term = System.getenv("TERM");
+        return term != null && !"dumb".equals(term);
     }
     
     /**

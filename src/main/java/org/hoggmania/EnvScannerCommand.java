@@ -46,12 +46,25 @@ import java.util.stream.Collectors;
 @QuarkusMain
 @TopCommand
 @Command(
-    name = "scan", 
-    mixinStandardHelpOptions = true, 
+    name = "scan",
     description = "Scan repository for build, IaC, and source files.",
     subcommands = {SbomCommand.class}
 )
+
 public class EnvScannerCommand implements Runnable {
+
+    /**
+     * Find files by pattern (supports wildcards like *.csproj).
+     * This method must be public static for use in SbomCommand.
+     */
+    public static List<Path> findFilesByPattern(Path root, String pattern) throws IOException {
+        String regex = pattern.replace("*", ".*").replace("?", ".");
+        List<Path> result = new ArrayList<>();
+        Files.find(root, Integer.MAX_VALUE, (p, attr) -> p.getFileName().toString().matches(regex))
+            .forEach(result::add);
+        return result;
+    }
+
 
     @Parameters(index = "0", description = "Root directory to scan.", defaultValue = "./")
     File rootDir;
@@ -243,7 +256,7 @@ public class EnvScannerCommand implements Runnable {
         System.out.println(ConsoleColors.bold("\nTool Versions:"));
         ((Map<String, ToolVersionInfo>) result.get("toolVersions")).forEach((tool, versionInfo) -> {
             String detected = versionInfo.isDetected() ? 
-                ConsoleColors.success("✓") : ConsoleColors.error("✗");
+                ConsoleColors.success("[OK]") : ConsoleColors.error("[NOT FOUND]");
             System.out.println("   " + tool + ": " + detected);
             if (versionInfo.isDetected()) {
                 // Print version information with indentation
@@ -644,7 +657,4 @@ public class EnvScannerCommand implements Runnable {
                 });
         return counts;
     }
-
-
-
 }

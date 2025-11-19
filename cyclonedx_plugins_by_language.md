@@ -1,5 +1,19 @@
 # CycloneDX SBOM Generators and Plugins by Language
 
+## Project Integration Notes (build.env.intel)
+
+- This project auto-detects build systems and invokes the correct CycloneDX plugin/CLI for each language.
+- SBOM generation is always JSON (CycloneDX v1.5+ recommended).
+- For multi-language/polyglot repos, all detected build systems are processed in a single run.
+- Output directory defaults to `generated-sboms/` (configurable via `--output`).
+- SBOM merging (for polyglot projects) is supported via the `--merge` flag.
+- All SBOM commands are executed in the directory where the build file exists (not repo root).
+- For .NET, wildcard project file detection is supported (e.g., `*.csproj`).
+- If no build system is detected, standalone JARs are scanned with Syft (requires Syft installed).
+- All commands and results are logged as JSON for traceability.
+
+# CycloneDX SBOM Generators and Plugins by Language
+
 This table lists the primary CycloneDX-supported tools for generating Software Bill of Materials (SBOMs) across major programming languages and ecosystems.
 
 | Language / Ecosystem | Tool / Plugin | Latest Version & Schema Support | Notes on Integration & CI/CD Usage |
@@ -20,6 +34,20 @@ This table lists the primary CycloneDX-supported tools for generating Software B
 ---
 
 ## Recommended CI/CD Integration Practices
+
+## Troubleshooting Common Errors
+
+- **Syntax error on token(s), misplaced construct(s):**
+	- This usually means a misplaced or extra curly brace (`}`) or code outside a class in a Java file.
+	- Ensure all methods and fields are inside the correct class (e.g., `EnvScannerCommand`).
+	- The license block at the top of Java files must be inside a `/* ... */` comment, immediately followed by the `package` declaration.
+	- No blank lines or stray characters should appear between the license comment and `package`.
+- **SBOM not generated:**
+	- Check that the required CycloneDX plugin/CLI is installed and available in your PATH.
+	- For standalone JARs, Syft must be installed separately: https://github.com/anchore/syft
+- **Output directory not created:**
+	- The tool will attempt to create the output directory if it does not exist, but check permissions if this fails.
+
 
 - **Generate SBOMs as part of the build stage** – integrate plugin or CLI invocation into your pipeline (e.g., Maven `package`, Gradle `build`, Go `build`, Python `install`).
 - **Use consistent SBOM formats and schema versions** (preferably CycloneDX v1.5 or newer).

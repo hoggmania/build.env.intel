@@ -137,7 +137,7 @@ public class SbomCommand implements Runnable {
             
             List<BuildSystemInfo> buildSystems = convertToBuildSystemInfo(detailedBuildSystems);
             
-            // If no build systems found, check for standalone JARs
+            // If no build systems found, check for standalone binaries
             if (buildSystems.isEmpty()) {
                 BuildSystemInfo jarSystem = detectStandaloneJars(rootDir.toPath(), outputDir);
                 if (jarSystem != null) {
@@ -157,7 +157,7 @@ public class SbomCommand implements Runnable {
                 System.err.println("  - Rust (Cargo.toml)");
                 System.err.println("  - PHP (composer.json)");
                 System.err.println("  - Ruby (Gemfile)");
-                System.err.println("  - Standalone JARs (*.jar with no package manager)");
+                System.err.println("  - Standalone Binaries (scanned with Syft)");
                 return;
             }
 
@@ -220,30 +220,30 @@ public class SbomCommand implements Runnable {
     }
 
     /**
-     * Detect standalone JAR files when no package manager is present.
-     * Returns a BuildSystemInfo if JARs are found, null otherwise.
+     * Detect standalone binaries when no package manager is present.
+     * Returns a BuildSystemInfo if binaries are found, null otherwise.
      */
     private BuildSystemInfo detectStandaloneJars(Path rootDir, File outputDir) throws IOException {
         org.hoggmania.generators.JarSbomGenerator jarGenerator = new org.hoggmania.generators.JarSbomGenerator();
-        
-        // Use the findBuildFiles method which checks for JARs and no package manager
-        List<Path> jarBuildFiles = jarGenerator.findBuildFiles(rootDir);
-        
-        if (jarBuildFiles.isEmpty()) {
+
+        // Use EnvScannerCommand utility to find JAR files
+        List<Path> jarBuildFiles = EnvScannerCommand.findFilesByPattern(rootDir, "*.jar");
+
+        if (jarBuildFiles == null || jarBuildFiles.isEmpty()) {
             return null;
         }
-        
-        // buildFile is the root directory for JAR generator
+
+        // buildFile is the root directory for binary scanner
         Path buildFile = jarBuildFiles.get(0);
         String projectName = jarGenerator.extractProjectName(buildFile);
         String sbomCommand = jarGenerator.generateSbomCommand(projectName, outputDir, buildFile);
-        
-        BuildSystemInfo info = new BuildSystemInfo("Standalone JARs", sbomCommand);
+
+        BuildSystemInfo info = new BuildSystemInfo("Standalone Binaries", sbomCommand);
         info.buildFiles = Collections.singletonList(buildFile.toString());
         info.multiModule = false;
         info.projectName = projectName;
-        info.workingDirectory = buildFile;
-        
+        info.workingDirectory = buildFile.getParent();
+
         return info;
     }
 
@@ -293,65 +293,86 @@ public class SbomCommand implements Runnable {
     }
 
     /**
-     * Generate SBOM for standalone JAR files.
+     * Generate SBOM for standalone binaries using Syft.
      */
     private SbomGenerationResult generateJarSbom(BuildSystemInfo buildInfo) {
         SbomGenerationResult result = new SbomGenerationResult(buildInfo);
         
         try {
             org.hoggmania.generators.JarSbomGenerator jarGenerator = new org.hoggmania.generators.JarSbomGenerator();
-            Path rootPath = buildInfo.workingDirectory;
             
-            // Find all JARs
-            List<org.hoggmania.generators.JarSbomGenerator.JarInfo> jarInfos = jarGenerator.findJars(rootPath);
+            // Check if Syft is available
+            System.out.println("Checking if Syft is installed...");
+            ProcessBuilder versionCheck = new ProcessBuilder();
+            if (System.getProperty("os.name").toLowerCase().contains("win")) {
+                versionCheck.command("cmd.exe", "/c", jarGenerator.getVersionCheckCommand());
+            } else {
+                versionCheck.command("sh", "-c", jarGenerator.getVersionCheckCommand());
+            }
             
-            if (jarInfos.isEmpty()) {
+            try {
+                Process versionProcess = versionCheck.start();
+                int versionExitCode = versionProcess.waitFor();
+                if (versionExitCode != 0) {
+                    result.success = false;
+                    result.errorMessage = "Syft is not installed or not in PATH. Please install Syft: https://github.com/anchore/syft";
+                    System.err.println(ConsoleColors.error("[ERROR]") + " " + result.errorMessage);
+                    writeSbomLogFile(result);
+                    return result;
+                }
+            } catch (Exception e) {
                 result.success = false;
-                result.errorMessage = "No JAR files found in project";
+                result.errorMessage = "Syft is not installed or not in PATH. Please install Syft: https://github.com/anchore/syft";
                 System.err.println(ConsoleColors.error("[ERROR]") + " " + result.errorMessage);
                 writeSbomLogFile(result);
                 return result;
             }
 
-            System.out.println("Found " + jarInfos.size() + " JAR file(s):");
-            
-            // Lookup each JAR in Maven Central
-            for (org.hoggmania.generators.JarSbomGenerator.JarInfo jarInfo : jarInfos) {
-                System.out.println("  " + jarInfo.getPath() + " (SHA1: " + jarInfo.getSha1() + ")");
-                try {
-                    List<org.hoggmania.generators.JarSbomGenerator.MavenArtifact> artifacts = 
-                            jarGenerator.lookupInMavenCentral(jarInfo.getSha1());
-                    jarInfo.setArtifacts(artifacts);
-                    
-                    if (artifacts.isEmpty()) {
-                        System.out.println("    → Not found in Maven Central, will use pkg:maven/unknown@" + jarInfo.getSha1());
-                    } else {
-                        System.out.println("    → Found " + artifacts.size() + " artifact(s) in Maven Central:");
-                        for (org.hoggmania.generators.JarSbomGenerator.MavenArtifact artifact : artifacts) {
-                            System.out.println("       - " + artifact.getPurl());
-                        }
-                    }
-                } catch (Exception e) {
-                    System.err.println("    → Failed to lookup in Maven Central: " + e.getMessage());
-                    // Leave artifacts empty - will use unknown
-                }
-            }
+            // Generate SBOM using Syft
+            Path primaryBuildFile = buildInfo.buildFiles != null && !buildInfo.buildFiles.isEmpty() ? Paths.get(buildInfo.buildFiles.get(0)) : null;
+            String sbomCommand = jarGenerator.generateSbomCommand(buildInfo.projectName, outputDir, primaryBuildFile);
+            System.out.println("Generating SBOM with Syft...");
+            System.out.println("Command: " + sbomCommand);
 
-            // Generate SBOM
-            File outputFile = new File(outputDir, buildInfo.projectName + "-bom.json");
-            jarGenerator.generateSbom(jarInfos, buildInfo.projectName, outputFile);
+            ProcessBuilder pb = new ProcessBuilder();
+            if (System.getProperty("os.name").toLowerCase().contains("win")) {
+                pb.command("cmd.exe", "/c", sbomCommand);
+            } else {
+                pb.command("sh", "-c", sbomCommand);
+            }
+            pb.directory(buildInfo.workingDirectory.toFile());
+            pb.redirectErrorStream(true);
+
+            Process process = pb.start();
+            String output = new String(process.getInputStream().readAllBytes());
+            int exitCode = process.waitFor();
+
+            result.output = output;
+            result.exitCode = exitCode;
+
+            if (exitCode == 0) {
+                File outputFile = new File(outputDir, buildInfo.projectName + "-bom.json");
+                System.out.println("\n" + ConsoleColors.success("[SUCCESS]") + " SBOM generated: " + outputFile.getAbsolutePath());
+                
+                result.success = true;
+                result.expectedSbomPath = outputFile.getAbsolutePath();
+                result.sbomFileExists = outputFile.exists();
+                if (outputFile.exists()) {
+                    result.sbomFileSize = outputFile.length();
+                }
+            } else {
+                result.success = false;
+                result.errorMessage = "Syft failed with exit code " + exitCode;
+                result.errorOutput = output;
+                System.err.println(ConsoleColors.error("[ERROR]") + " " + result.errorMessage);
+                System.err.println(output);
+            }
             
-            System.out.println("\n" + ConsoleColors.success("[SUCCESS]") + " SBOM generated: " + outputFile.getAbsolutePath());
-            
-            result.success = true;
-            result.expectedSbomPath = outputFile.getAbsolutePath();
-            result.sbomFileExists = outputFile.exists();
-            result.sbomFileSize = outputFile.length();
             writeSbomLogFile(result);
             
         } catch (Exception e) {
             result.success = false;
-            result.errorMessage = "Failed to generate JAR SBOM: " + e.getMessage();
+            result.errorMessage = "Failed to generate SBOM with Syft: " + e.getMessage();
             result.errorOutput = e.toString();
             System.err.println(ConsoleColors.error("[ERROR]") + " " + result.errorMessage);
             e.printStackTrace();
@@ -364,8 +385,8 @@ public class SbomCommand implements Runnable {
     private SbomGenerationResult generateSbomWithDetails(BuildSystemInfo buildInfo) {
         SbomGenerationResult result = new SbomGenerationResult(buildInfo);
         
-        // Special handling for standalone JARs - generate SBOM directly
-        if ("Standalone JARs".equals(buildInfo.buildSystem)) {
+        // Special handling for standalone binaries - generate SBOM with Syft
+        if ("Standalone Binaries".equals(buildInfo.buildSystem)) {
             return generateJarSbom(buildInfo);
         }
         

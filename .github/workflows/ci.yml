@@ -50,7 +50,7 @@ jobs:
         run: ./mvnw package -B -Dquarkus.package.jar.type=uber-jar
 
       - name: Upload JVM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bei-jvm-${{ steps.os_info.outputs.os_info }}-${{ steps.get_version.outputs.version }}
           path: target/*-runner.jar
@@ -74,7 +74,7 @@ jobs:
         run: ./mvnw package -B -Pnative -Dquarkus.native.container-build=true
 
       - name: Upload Native artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bei-native-${{ needs.build.outputs.os_info }}-${{ needs.build.outputs.version }}
           path: target/*-runner
@@ -97,13 +97,13 @@ jobs:
           echo "Tag version: $TAG_VERSION"
 
       - name: Download JVM artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: bei-jvm-${{ needs.build.outputs.os_info }}-${{ steps.tag_version.outputs.tag_version }}
           path: artifacts/jvm
 
       - name: Download Native artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: bei-native-${{ needs.build.outputs.os_info }}-${{ steps.tag_version.outputs.tag_version }}
           path: artifacts/native
